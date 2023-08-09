@@ -1,0 +1,3 @@
+#!/bin/sh
+
+start-stop-daemon --start --name aesdsocket --exec /usr/bin/aesdsocket -- -- -d
