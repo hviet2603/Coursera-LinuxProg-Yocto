@@ -42,11 +42,8 @@ int create_log_file()
     fp = fopen(LOG_FILE, "w");
     if (fp == NULL)
     {
-        // printf("Failed to create file.\n");
         return 1;
     }
-
-    // printf("File created successfully.\n");
 
     fclose(fp);
     return 0;
@@ -59,7 +56,6 @@ int log_message(char *message)
     fp = fopen(LOG_FILE, "a");
     if (fp == NULL)
     {
-        // printf("Failed to open file.\n");
         return 1;
     }
 
@@ -250,8 +246,6 @@ int server_handle_connections(int sockfd)
         exit(1);
     }
 
-    // printf("server: waiting for connections...\n");
-
     while (1)
     { // main accept() loop
         if (should_exit)
@@ -347,7 +341,6 @@ int main(int argc, char **argv)
     {
         if (opt == 'd')
         {
-            //printf("Start server in daemon mode.\n");
             daemon = true;
         }
     }
