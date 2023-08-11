@@ -12,6 +12,10 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <syslog.h>
+#include <stdint.h>
+#include <time.h>
+
+#include "aesd_thread_list.h"
 
 #define PORT "9000"
 #define BACKLOG 10      // how many pending connections queue will hold
@@ -23,6 +27,8 @@
 #define SERVER_SYSLOG_EXIT 2
 
 bool should_exit = false;
+AESDThreadList *server_thread_list = NULL;
+pthread_mutex_t server_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -99,7 +105,7 @@ int send_file_content(int fd)
     rewind(fp);
 
     // Allocate buffer
-    buffer = malloc(file_size+1);
+    buffer = malloc(file_size + 1);
     if (!buffer)
     {
         perror("malloc");
@@ -118,7 +124,7 @@ int send_file_content(int fd)
 
     // Print buffer contents
     int rv = send(fd, buffer, file_size, 0);
-  
+
     // Free buffer
     free(buffer);
 
@@ -165,7 +171,7 @@ void setup_signal_handlers(struct sigaction *sa)
 }
 
 bool is_message_end(char *chunk)
-{   
+{
     int len = strlen(chunk);
     for (int i = 0; i < len; i++)
     {
@@ -173,7 +179,7 @@ bool is_message_end(char *chunk)
         {
             return true;
         }
-    }        
+    }
     return false;
 }
 
@@ -184,60 +190,138 @@ int server_bind()
     int rv;
     int yes = 1;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE; // use my IP
-
-    if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0)
+    while (1)
     {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-        return 1;
-    }
 
-    // loop through all the results and bind to the first we can
-    for (p = servinfo; p != NULL; p = p->ai_next)
-    {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype,
-                             p->ai_protocol)) == -1)
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE; // use my IP
+
+        if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0)
         {
-            perror("server: socket");
-            continue;
+            fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+            return 1;
         }
 
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
-                       sizeof(int)) == -1)
+        // loop through all the results and bind to the first we can
+        for (p = servinfo; p != NULL; p = p->ai_next)
         {
-            perror("setsockopt");
-            exit(1);
+            if ((sockfd = socket(p->ai_family, p->ai_socktype,
+                                 p->ai_protocol)) == -1)
+            {
+                perror("server: socket");
+                continue;
+            }
+
+            if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
+                           sizeof(int)) == -1)
+            {
+                perror("setsockopt");
+                exit(1);
+            }
+
+            if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1)
+            {
+                close(sockfd);
+                perror("server: bind");
+                continue;
+            }
+
+            break;
         }
 
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1)
+        freeaddrinfo(servinfo); // all done with this structure
+
+        if (p == NULL)
         {
-            close(sockfd);
-            perror("server: bind");
+            fprintf(stderr, "server: failed to bind\n");
+            sleep(1);
             continue;
+            //exit(1);
         }
 
         break;
     }
 
-    freeaddrinfo(servinfo); // all done with this structure
+    return sockfd;
+}
 
-    if (p == NULL)
+void server_time_log_thread(void)
+{
+    time_t rawtime;
+    struct tm *timeinfo;
+    char buf[60];
+    int ctr = 0;
+
+    while (!should_exit)
     {
-        fprintf(stderr, "server: failed to bind\n");
-        exit(1);
+        sleep(1);
+        if (ctr == 9)
+        {
+            memset(buf, 0, sizeof(buf));
+            time(&rawtime);
+            timeinfo = localtime(&rawtime);
+            strftime(buf, sizeof(buf), "timestamp: %Y-%m-%d %H:%M:%S\n", timeinfo);
+            pthread_mutex_lock(&server_thread_mutex);
+            log_message(buf);
+            pthread_mutex_unlock(&server_thread_mutex);
+        }
+        ctr = ctr == 9 ? 0 : (ctr + 1);
+    }
+}
+
+void server_handle_connection_thread(void *args)
+{
+    // Extract args
+    uint8_t *args_buf = (uint8_t *)args;
+    int new_fd;
+    char client_addr[INET_ADDRSTRLEN];
+    memcpy(&new_fd, args_buf, sizeof(int));
+    memcpy(client_addr, args_buf + sizeof(int), INET_ADDRSTRLEN);
+    free(args);
+
+    char buf[MAXDATASIZE];
+
+    int numbytes = 0;
+    while (1)
+    {
+        numbytes = recv(new_fd, buf, MAXDATASIZE - 1, 0);
+        if (numbytes == -1)
+        {
+            perror("recv");
+            exit(1);
+        }
+        else if (numbytes > 0)
+        {
+            buf[numbytes] = '\0';
+            pthread_mutex_lock(&server_thread_mutex);
+            log_message(buf);
+            pthread_mutex_unlock(&server_thread_mutex);
+            if (is_message_end(buf))
+            {
+                break;
+            }
+        }
+        else
+        {
+            break;
+        }
     }
 
-    return sockfd;
+    if (send_file_content(new_fd) == -1)
+    {
+        perror("send");
+    }
+
+    close(new_fd);
+    server_syslog(SERVER_SYSLOG_DISCONNECT, client_addr);
 }
 
 int server_handle_connections(int sockfd)
 {
     int new_fd;
     socklen_t sin_size;
-    char buf[MAXDATASIZE];
     char s[INET_ADDRSTRLEN];
 
     if (listen(sockfd, BACKLOG) == -1)
@@ -250,6 +334,20 @@ int server_handle_connections(int sockfd)
     { // main accept() loop
         if (should_exit)
         {
+            if (server_thread_list == NULL)
+            {
+                printf("Thread list is not initialized\n");
+                break;
+            }
+
+            AESDThread *server_thread = server_thread_list->head;
+            while (server_thread != NULL)
+            {
+                aesd_thread_join(server_thread, NULL);
+                server_thread = server_thread->next;
+            }
+
+            aesd_thread_list_free(server_thread_list);
             break;
         }
 
@@ -268,37 +366,11 @@ int server_handle_connections(int sockfd)
         // printf("server: got connection from %s\n", s);
         server_syslog(SERVER_SYSLOG_CONNECT, s);
 
-        int numbytes = 0;
-        while (1)
-        {
-            numbytes = recv(new_fd, buf, MAXDATASIZE - 1, 0);
-            if (numbytes == -1)
-            {
-                perror("recv");
-                exit(1);
-            }
-            else if (numbytes > 0)
-            {
-                buf[numbytes] = '\0';
-                log_message(buf);
-                if (is_message_end(buf))
-                {
-                    break;
-                }
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        if (send_file_content(new_fd) == -1)
-        {
-            perror("send");
-        }
-
-        close(new_fd);
-        server_syslog(SERVER_SYSLOG_DISCONNECT, s);
+        uint8_t *args = malloc(sizeof(int) + INET_ADDRSTRLEN);
+        memcpy(args, &new_fd, sizeof(int));
+        memcpy(args + sizeof(int), s, INET_ADDRSTRLEN);
+        AESDThread *server_thread = aesd_thread_create(NULL, (void *(*)(void *))server_handle_connection_thread, (void *)args);
+        aesd_thread_list_push(server_thread_list, server_thread);
     }
 
     close(sockfd);
@@ -314,6 +386,8 @@ int start_socket_server(bool daemon)
     {
         if (!fork())
         {
+            AESDThread *server_timer_thread = aesd_thread_create(NULL, (void *(*)(void *))server_time_log_thread, NULL);
+            aesd_thread_list_push(server_thread_list, server_timer_thread);
             server_handle_connections(sockfd);
         }
         else
@@ -323,6 +397,8 @@ int start_socket_server(bool daemon)
     }
     else
     {
+        AESDThread *server_timer_thread = aesd_thread_create(NULL, (void *(*)(void *))server_time_log_thread, NULL);
+        aesd_thread_list_push(server_thread_list, server_timer_thread);
         return server_handle_connections(sockfd);
     }
 
@@ -335,7 +411,9 @@ int main(int argc, char **argv)
     struct sigaction sa;
     setup_signal_handlers(&sa);
     bool daemon = false;
-    
+
+    server_thread_list = aesd_thread_list_init();
+
     int opt;
     while ((opt = getopt(argc, argv, "d")) != -1)
     {
@@ -344,7 +422,7 @@ int main(int argc, char **argv)
             daemon = true;
         }
     }
-    
+
     start_socket_server(daemon);
 
     return 0;
